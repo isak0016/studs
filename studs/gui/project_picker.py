@@ -2,22 +2,35 @@
 from __future__ import annotations
 
 import gzip
-import json
+import io
 import platform
-import secrets
 import subprocess
 import threading
 import tkinter as tk
+import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+from urllib.parse import unquote
 import xml.etree.ElementTree as ET
 
-from studs.config import CONFIG_PATH, load_config, save_config
-from studs.drive_api import folder_id_by_name, remote_path_for_id, share_project_folder
+from studs.config import CONFIG_PATH, RCLONE_BIN, load_config, save_config
+from studs.drive_api import remote_path_for_id, share_project_folder
+from studs.sync import (
+    GDRIVE_REMOTE_NAME,
+    add_contributor,
+    create_new_project,
+    load_projects,
+    pull_archive,
+    push_archive,
+    read_contributors,
+    remote_archive_mtime,
+    remote_archive_path_for,
+    save_projects,
+    upsert_project,
+)
+from studs.vst_scan.scanner import scan_installed_plugins
 
-MAX_PROJECTS = 20
-CONTRIBUTORS_FILENAME = ".studs_contributors.json"
-GDRIVE_REMOTE_NAME = "studs_gdrive"
 RCLONE_OAUTH_PORT = 53682  # rclone's default local OAuth redirect port
 
 
@@ -62,82 +75,64 @@ def ensure_config_exists() -> None:
 def rclone_remote_exists(name: str) -> bool:
     if not name:
         return False
-    result = subprocess.run(["rclone", "listremotes"], capture_output=True, text=True)
+    result = subprocess.run([RCLONE_BIN, "listremotes"], capture_output=True, text=True)
     remotes = [r.strip().rstrip(":") for r in result.stdout.splitlines() if r.strip()]
     return name in remotes
-
-
-def load_projects() -> list[dict]:
-    return load_config().get("projects", [])
-
-
-def save_projects(projects: list[dict]) -> None:
-    config = load_config()
-    config["projects"] = projects
-    save_config(config)
-
-
-def upsert_project(projects: list[dict], path: str, sync_code: str, role: str) -> list[dict]:
-    projects = [p for p in projects if p["path"] != path]
-    projects.insert(0, {"path": path, "sync_code": sync_code, "role": role})
-    return projects[:MAX_PROJECTS]
-
-
-def _read_contributors(project_dir: Path) -> list[str]:
-    f = project_dir / CONTRIBUTORS_FILENAME
-    if not f.exists():
-        return []
-    try:
-        return json.loads(f.read_text())
-    except (json.JSONDecodeError, OSError):
-        return []
-
-
-def _add_contributor(project_dir: Path, username: str) -> None:
-    if not username:
-        return
-    contributors = _read_contributors(project_dir)
-    if username not in contributors:
-        contributors.append(username)
-        (project_dir / CONTRIBUTORS_FILENAME).write_text(json.dumps(contributors, indent=2))
 
 
 def _looks_like_ableton_project(path: Path) -> bool:
     return any(path.rglob("*.als"))
 
 
-def _count_tracks_in_als_bytes(data: bytes) -> int:
+def _parse_als_info(data: bytes) -> dict:
     root = ET.fromstring(gzip.decompress(data))
     tracks = root.find(".//Tracks")
-    return len(tracks) if tracks is not None else 0
+    track_count = len(tracks) if tracks is not None else 0
+
+    # Plugin devices store their name either directly (VST2's PlugName) or only
+    # in the browser path breadcrumb (VST3), e.g. "view:X-Plugins#Vendor:Name".
+    vst_names = set()
+    for device in root.iter("PluginDevice"):
+        browser_path = device.find(".//BrowserContentPath")
+        if browser_path is not None and browser_path.get("Value"):
+            after_hash = browser_path.get("Value").split("#")[-1]
+            name = after_hash.split(":")[-1] if ":" in after_hash else after_hash
+            vst_names.add(unquote(name))
+            continue
+        plug_name = device.find(".//PlugName")
+        if plug_name is not None and plug_name.get("Value"):
+            vst_names.add(plug_name.get("Value"))
+
+    return {"track_count": track_count, "vst_names": sorted(vst_names)}
 
 
-def _local_track_count(project_dir: Path) -> int | None:
+def _local_als_info(project_dir: Path) -> dict | None:
     candidates = sorted(project_dir.glob("*.als"))
     if not candidates:
         return None
-    return _count_tracks_in_als_bytes(candidates[0].read_bytes())
+    return _parse_als_info(candidates[0].read_bytes())
 
 
-def _remote_track_count(remote_path: str) -> int | None:
-    listing = subprocess.run(
-        ["rclone", "lsf", remote_path, "--include", "*.als"],
-        capture_output=True,
-        text=True,
-    )
-    filenames = [line.strip() for line in listing.stdout.splitlines() if line.strip()]
-    if not filenames:
-        return None
-    cat = subprocess.run(["rclone", "cat", f"{remote_path}/{filenames[0]}"], capture_output=True)
+def _remote_als_info(remote_archive_path: str) -> dict | None:
+    # Pulls the whole (small, compressed) archive into memory rather than
+    # making a separate Drive API call per file inside it.
+    cat = subprocess.run([RCLONE_BIN, "cat", remote_archive_path], capture_output=True)
     if cat.returncode != 0:
         return None
-    return _count_tracks_in_als_bytes(cat.stdout)
+    try:
+        with zipfile.ZipFile(io.BytesIO(cat.stdout)) as zf:
+            als_names = sorted(n for n in zf.namelist() if n.endswith(".als"))
+            if not als_names:
+                return None
+            return _parse_als_info(zf.read(als_names[0]))
+    except zipfile.BadZipFile:
+        return None
 
 
 class ProjectPickerApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        root.title("Studs")
+        root.title("studs")
         root.resizable(False, False)
 
         self.projects: list[dict] = load_projects()
@@ -167,10 +162,10 @@ class ProjectPickerApp:
         self.import_tab = tk.Frame(self.notebook)
         self.manage_tab = tk.Frame(self.notebook)
         self.settings_tab = tk.Frame(self.notebook)
-        self.notebook.add(self.new_tab, text="New Project")
-        self.notebook.add(self.import_tab, text="Import Project")
-        self.notebook.add(self.manage_tab, text="Manage Projects")
-        self.notebook.add(self.settings_tab, text="Settings")
+        self.notebook.add(self.new_tab, text="new project")
+        self.notebook.add(self.import_tab, text="import project")
+        self.notebook.add(self.manage_tab, text="manage projects")
+        self.notebook.add(self.settings_tab, text="settings")
 
         self._build_new_tab()
         self._build_import_tab()
@@ -178,10 +173,13 @@ class ProjectPickerApp:
         self._build_settings_tab()
 
         self._update_new_tab_gate()
-        if not rclone_remote_exists(GDRIVE_REMOTE_NAME):
+        if rclone_remote_exists(GDRIVE_REMOTE_NAME):
+            self.notebook.select(self.manage_tab)
+        else:
+            self.notebook.select(self.settings_tab)
             self._banner(
-                "Before you can create new projects, go to Settings and click "
-                "'GDrive Setup' to connect your Google account.",
+                "before you can create new projects, go to settings and click "
+                "'gdrive setup' to connect your google account.",
                 "error",
             )
 
@@ -211,61 +209,105 @@ class ProjectPickerApp:
 
         threading.Thread(target=runner, daemon=True).start()
 
-    def _async_sync(
+    def _async_push_archive(
         self,
-        src: str,
-        dst: str,
+        local_folder: str,
+        remote_archive_path: str,
         status_label: tk.Label,
         on_success,
         button: tk.Button | None = None,
     ) -> None:
-        status_label.config(text=f"Working: {src} -> {dst}...", fg="gray")
+        """Zips the whole local folder and uploads it as one file — one Drive API
+        call instead of one per file inside, which is what actually caused the
+        rate-limit slowdowns with plain `rclone sync` on many-small-file projects."""
+        status_label.config(text=f"packaging and uploading {local_folder}...", fg="gray")
         if button is not None:
             button.config(state="disabled")
 
-        def work() -> subprocess.CompletedProcess:
-            return subprocess.run(
-                ["rclone", "sync", src, dst, "--progress"], capture_output=True, text=True
-            )
+        def work() -> dict:
+            return push_archive(local_folder, remote_archive_path)
 
-        def done(result: subprocess.CompletedProcess) -> None:
+        def done(result: dict) -> None:
             if button is not None:
                 button.config(state="normal")
-            if result.returncode == 0:
-                status_label.config(text="Done.", fg="green")
-                self._banner(f"Synced: {src} -> {dst}", "success")
-                on_success()
+            if result["ok"]:
+                status_label.config(text="done.", fg="green")
+                self._banner(f"pushed to {remote_archive_path}", "success")
+                on_success(result["mtime"])
             else:
-                status_label.config(text="Failed.", fg="red")
-                self._banner(f"Sync failed: {result.stderr or 'Unknown error'}", "error")
+                status_label.config(text="failed.", fg="red")
+                self._banner(f"push failed: {result['error'] or 'unknown error'}", "error")
 
         self._run_async(work, done)
 
-    def _remember_project(self, path: str, code: str, role: str) -> None:
-        self.projects = upsert_project(self.projects, path, code, role)
+    def _async_pull_archive(
+        self,
+        remote_archive_path: str,
+        local_folder: str,
+        status_label: tk.Label,
+        on_success,
+        button: tk.Button | None = None,
+    ) -> None:
+        status_label.config(text=f"downloading and unpacking to {local_folder}...", fg="gray")
+        if button is not None:
+            button.config(state="disabled")
+
+        def work() -> dict:
+            return pull_archive(remote_archive_path, local_folder)
+
+        def done(result: dict) -> None:
+            if button is not None:
+                button.config(state="normal")
+            if result["ok"]:
+                status_label.config(text="done.", fg="green")
+                self._banner(f"pulled from {remote_archive_path}", "success")
+                on_success(result["mtime"])
+            else:
+                status_label.config(text="failed.", fg="red")
+                self._banner(f"pull failed: {result['error'] or 'unknown error'}", "error")
+
+        self._run_async(work, done)
+
+    def _remember_project(
+        self,
+        path: str,
+        code: str,
+        role: str,
+        last_pushed: str | None = None,
+        last_pushed_by: str | None = None,
+        display_name: str | None = None,
+        synced_remote_mtime: str | None = None,
+    ) -> None:
+        self.projects = upsert_project(
+            self.projects,
+            path,
+            code,
+            role,
+            last_pushed=last_pushed,
+            last_pushed_by=last_pushed_by,
+            display_name=display_name,
+            synced_remote_mtime=synced_remote_mtime,
+        )
         save_projects(self.projects)
         self._refresh_manage_list()
 
     def _share_folder(self, code: str, email: str, status_label: tk.Label) -> None:
-        status_label.config(text=f"Sharing with {email}...", fg="gray")
+        status_label.config(text=f"sharing with {email}...", fg="gray")
         self.root.update_idletasks()
         try:
             share_project_folder(GDRIVE_REMOTE_NAME, code, email)
         except RuntimeError as e:
-            status_label.config(text="Share failed.", fg="red")
-            self._banner(f"Share failed: {e}", "error")
+            status_label.config(text="share failed.", fg="red")
+            self._banner(f"share failed: {e}", "error")
             return
-        status_label.config(text=f"Shared with {email}.", fg="green")
+        status_label.config(text=f"shared with {email}.", fg="green")
         self._banner(f"{email} now has editor access to this project's folder.", "success")
 
     def _require_username(self) -> bool:
         if self.username_var.get().strip():
             return True
-        self._banner("Set your username in the Settings tab first.", "error")
+        self._banner("set your username in the settings tab first.", "error")
         return False
-
-    def _remote_path_for(self, code: str) -> str:
-        return remote_path_for_id(GDRIVE_REMOTE_NAME, code)
 
     def _update_new_tab_gate(self) -> None:
         configured = rclone_remote_exists(GDRIVE_REMOTE_NAME)
@@ -281,7 +323,7 @@ class ProjectPickerApp:
 
         tk.Label(
             frame,
-            text="Pick a local Ableton project folder to start syncing:",
+            text="pick a local ableton project folder to start syncing:",
             wraplength=420,
             justify="left",
         ).grid(row=0, column=0, columnspan=2, sticky="w", padx=12, pady=8)
@@ -289,34 +331,42 @@ class ProjectPickerApp:
         tk.Entry(frame, textvariable=self.new_path_var, width=50, state="readonly").grid(
             row=1, column=0, padx=(12, 4), pady=4, sticky="we"
         )
-        tk.Button(frame, text="Browse...", command=self._new_browse).grid(
+        ttk.Button(frame, text="browse...", command=self._new_browse).grid(
             row=1, column=1, padx=(4, 12), pady=4
         )
 
         self.new_status_label = tk.Label(frame, text="", fg="gray")
         self.new_status_label.grid(row=2, column=0, columnspan=2, sticky="w", padx=12, pady=4)
 
-        self.new_push_button = tk.Button(
-            frame, text="Push to Drive", width=16, command=self._new_push
+        tk.Label(frame, text="project name (optional — only changes how it's displayed in manage projects):").grid(
+            row=3, column=0, columnspan=2, sticky="w", padx=12, pady=(4, 0)
         )
-        self.new_push_button.grid(row=3, column=0, columnspan=2, pady=12)
+        self.new_display_name_var = tk.StringVar()
+        tk.Entry(frame, textvariable=self.new_display_name_var, width=50).grid(
+            row=4, column=0, columnspan=2, padx=12, pady=4, sticky="we"
+        )
 
-        tk.Label(frame, text="Sync code (appears after pushing — share it with your partner):").grid(
-            row=4, column=0, columnspan=2, sticky="w", padx=12, pady=(4, 0)
+        self.new_push_button = ttk.Button(
+            frame, text="push to drive", width=16, command=self._new_push
+        )
+        self.new_push_button.grid(row=5, column=0, columnspan=2, pady=12)
+
+        tk.Label(frame, text="sync code (appears after pushing — share it with your partner):").grid(
+            row=6, column=0, columnspan=2, sticky="w", padx=12, pady=(4, 0)
         )
         tk.Entry(frame, textvariable=self.new_code_var, width=50, state="readonly").grid(
-            row=5, column=0, columnspan=2, padx=12, pady=4, sticky="we"
+            row=7, column=0, columnspan=2, padx=12, pady=4, sticky="we"
         )
 
         tk.Label(
-            frame, text="Partner's Google account email (grants access to just this project):"
-        ).grid(row=6, column=0, columnspan=2, sticky="w", padx=12, pady=(4, 0))
+            frame, text="partner's google account email (grants access to just this project):"
+        ).grid(row=8, column=0, columnspan=2, sticky="w", padx=12, pady=(4, 0))
         self.new_partner_email_var = tk.StringVar()
         tk.Entry(frame, textvariable=self.new_partner_email_var, width=40).grid(
-            row=7, column=0, padx=(12, 4), pady=4, sticky="we"
+            row=9, column=0, padx=(12, 4), pady=4, sticky="we"
         )
-        self.new_share_button = tk.Button(frame, text="Share with Partner", command=self._new_share)
-        self.new_share_button.grid(row=7, column=1, padx=(4, 12), pady=4)
+        self.new_share_button = ttk.Button(frame, text="share with partner", command=self._new_share)
+        self.new_share_button.grid(row=9, column=1, padx=(4, 12), pady=4)
 
         self._update_new_tab_buttons()
 
@@ -327,18 +377,19 @@ class ProjectPickerApp:
 
     def _new_browse(self) -> None:
         selected = filedialog.askdirectory(
-            title="Select Ableton Project Folder", initialdir=str(Path.home())
+            title="select ableton project folder", initialdir=str(Path.home())
         )
         if not selected:
             return
         self.new_path_var.set(selected)
         self.new_pushed = False
         self.new_code_var.set("")
+        self.new_display_name_var.set("")
         if _looks_like_ableton_project(Path(selected)):
-            self.new_status_label.config(text="Found .als project file(s).", fg="green")
+            self.new_status_label.config(text="found .als project file(s).", fg="green")
         else:
             self.new_status_label.config(
-                text="Warning: no .als files found in this folder or its subfolders.",
+                text="warning: no .als files found in this folder or its subfolders.",
                 fg="#b8860b",
             )
         self._update_new_tab_buttons()
@@ -346,56 +397,47 @@ class ProjectPickerApp:
     def _new_push(self) -> None:
         path = self.new_path_var.get()
         if not path or not Path(path).is_dir():
-            self._banner("Please choose a folder first.", "error")
+            self._banner("please choose a folder first.", "error")
             return
         if not self._require_username():
             return
 
-        # Push into a fresh, throwaway-named folder — the name itself is never used
-        # again; what matters is the real Drive folder ID, resolved right after.
-        temp_name = secrets.token_hex(8)
-        remote_dst = f"{GDRIVE_REMOTE_NAME}:studs/{temp_name}"
-        _add_contributor(Path(path), self.username_var.get().strip())
+        add_contributor(Path(path), self.username_var.get().strip())
 
-        self.new_status_label.config(text=f"Working: {path} -> {remote_dst}...", fg="gray")
+        self.new_status_label.config(text=f"packaging and uploading {path}...", fg="gray")
         self.new_push_button.config(state="disabled")
+        username = self.username_var.get().strip()
 
         def work() -> dict:
-            result = subprocess.run(
-                ["rclone", "sync", path, remote_dst, "--progress"], capture_output=True, text=True
-            )
-            if result.returncode != 0:
-                return {"ok": False, "error": result.stderr}
-            return {"ok": True, "folder_id": folder_id_by_name(GDRIVE_REMOTE_NAME, "studs", temp_name)}
+            return create_new_project(path, username)
 
         self._run_async(work, lambda r: self._new_push_done(r, path))
 
     def _new_push_done(self, r: dict, path: str) -> None:
         if not r["ok"]:
-            self.new_status_label.config(text="Failed.", fg="red")
-            self._banner(f"Sync failed: {r['error'] or 'Unknown error'}", "error")
+            self.new_status_label.config(text="failed.", fg="red")
+            self._banner(f"sync failed: {r['error'] or 'unknown error'}", "error")
             self._update_new_tab_buttons()
             return
 
-        folder_id = r["folder_id"]
-        if not folder_id:
-            self.new_status_label.config(text="Push succeeded but ID lookup failed.", fg="red")
-            self._banner(
-                "Push succeeded but its Drive folder ID couldn't be resolved. Try Push again.",
-                "error",
-            )
-            self._update_new_tab_buttons()
-            return
-
-        self.new_status_label.config(text="Done.", fg="green")
+        folder_id = r["sync_code"]
+        self.new_status_label.config(text="done.", fg="green")
         self.new_code_var.set(folder_id)
         self.new_pushed = True
-        self._remember_project(path, folder_id, "created")
+        self._remember_project(
+            path,
+            folder_id,
+            "created",
+            last_pushed=datetime.now(timezone.utc).isoformat(),
+            last_pushed_by=self.username_var.get().strip(),
+            display_name=self.new_display_name_var.get().strip() or None,
+            synced_remote_mtime=r["mtime"],
+        )
         self.root.clipboard_clear()
         self.root.clipboard_append(folder_id)
         self._banner(
-            f"Pushed. Sync code copied to clipboard: {folder_id} — "
-            "send it to your partner, then Share with Partner below.",
+            f"pushed. sync code copied to clipboard: {folder_id} — "
+            "send it to your partner, then share with partner below.",
             "success",
         )
         self._update_new_tab_buttons()
@@ -404,10 +446,10 @@ class ProjectPickerApp:
         code = self.new_code_var.get()
         email = self.new_partner_email_var.get().strip()
         if not self.new_pushed:
-            self._banner("Push this project to Drive before sharing it.", "error")
+            self._banner("push this project to drive before sharing it.", "error")
             return
         if not email:
-            self._banner("Enter your partner's Google account email.", "error")
+            self._banner("enter your partner's google account email.", "error")
             return
         self._share_folder(code, email, self.new_status_label)
 
@@ -419,7 +461,7 @@ class ProjectPickerApp:
 
         tk.Label(
             frame,
-            text="Enter the sync code your partner sent you:",
+            text="enter the sync code your partner sent you:",
             wraplength=420,
             justify="left",
         ).grid(row=0, column=0, columnspan=2, sticky="w", padx=12, pady=8)
@@ -431,29 +473,29 @@ class ProjectPickerApp:
         self.import_status_label = tk.Label(frame, text="", fg="gray")
         self.import_status_label.grid(row=2, column=0, columnspan=2, sticky="w", padx=12, pady=4)
 
-        self.import_pull_button = tk.Button(
-            frame, text="Pull from Drive", width=16, command=self._import_pull
+        self.import_pull_button = ttk.Button(
+            frame, text="pull from drive", width=16, command=self._import_pull
         )
         self.import_pull_button.grid(row=3, column=0, columnspan=2, pady=12)
 
     def _import_pull(self) -> None:
         code = self.import_code_var.get().strip()
         if not code:
-            self._banner("Enter a sync code first.", "error")
+            self._banner("enter a sync code first.", "error")
             return
 
         selected = filedialog.askdirectory(
-            title="Choose where to save this project locally", initialdir=str(Path.home())
+            title="choose where to save this project locally", initialdir=str(Path.home())
         )
         if not selected:
             return
 
-        def on_success() -> None:
-            self._remember_project(selected, code, "imported")
+        def on_success(mtime) -> None:
+            self._remember_project(selected, code, "imported", synced_remote_mtime=mtime)
             self.import_code_var.set("")
 
-        self._async_sync(
-            self._remote_path_for(code),
+        self._async_pull_archive(
+            remote_archive_path_for(code),
             selected,
             self.import_status_label,
             on_success,
@@ -464,8 +506,9 @@ class ProjectPickerApp:
 
     def _build_manage_tab(self) -> None:
         frame = self.manage_tab
+        self.manage_stale: set[str] = set()  # paths where drive has a newer push than we have
 
-        tk.Label(frame, text="Your projects (select one):").grid(
+        tk.Label(frame, text="your projects (select one):").grid(
             row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(8, 0)
         )
         self.manage_listbox = tk.Listbox(frame, height=8, width=60)
@@ -477,47 +520,93 @@ class ProjectPickerApp:
 
         button_row = tk.Frame(frame)
         button_row.grid(row=3, column=0, columnspan=2, pady=8)
-        self.manage_push_button = tk.Button(
-            button_row, text="Push to Drive", width=14, command=self._manage_push
+        self.manage_push_button = ttk.Button(
+            button_row, text="push to drive", width=14, command=self._manage_push
         )
         self.manage_push_button.pack(side="left", padx=6)
-        self.manage_pull_button = tk.Button(
-            button_row, text="Pull from Drive", width=14, command=self._manage_pull
+        self.manage_pull_button = ttk.Button(
+            button_row, text="pull from drive", width=14, command=self._manage_pull
         )
         self.manage_pull_button.pack(side="left", padx=6)
-        tk.Button(
-            button_row, text="Check Track Counts", command=self._manage_check_tracks
+        ttk.Button(
+            button_row, text="project info", command=self._manage_project_info
         ).pack(side="left", padx=6)
 
         self.manage_status_label = tk.Label(frame, text="", fg="gray")
         self.manage_status_label.grid(row=4, column=0, columnspan=2, sticky="w", padx=12, pady=4)
 
-        tk.Label(frame, text="Add a collaborator's Google email (access to just this project):").grid(
-            row=5, column=0, columnspan=2, sticky="w", padx=12, pady=(8, 0)
+        self.manage_info_text = tk.Text(
+            frame,
+            height=4,
+            width=58,
+            wrap="word",
+            relief="flat",
+            borderwidth=0,
+            bg=self._default_bg,
+            font=("TkDefaultFont", 10),
+        )
+        self.manage_info_text.grid(row=5, column=0, columnspan=2, sticky="we", padx=12, pady=4)
+        self.manage_info_text.tag_configure("green", foreground="#2e7d32")
+        self.manage_info_text.tag_configure("red", foreground="#c62828")
+        self.manage_info_text.tag_configure("mismatch", foreground="#b8860b")
+        self.manage_info_text.config(state="disabled")
+
+        tk.Label(frame, text="add a collaborator's google email (access to just this project):").grid(
+            row=6, column=0, columnspan=2, sticky="w", padx=12, pady=(8, 0)
         )
         self.manage_partner_email_var = tk.StringVar()
         tk.Entry(frame, textvariable=self.manage_partner_email_var, width=40).grid(
-            row=6, column=0, padx=(12, 4), pady=4, sticky="we"
+            row=7, column=0, padx=(12, 4), pady=4, sticky="we"
         )
-        tk.Button(frame, text="Share with Partner", command=self._manage_share).grid(
-            row=6, column=1, padx=(4, 12), pady=4
+        ttk.Button(frame, text="share with partner", command=self._manage_share).grid(
+            row=7, column=1, padx=(4, 12), pady=4
         )
 
         self._refresh_manage_list()
 
-    def _refresh_manage_list(self) -> None:
+    def _render_manage_list(self) -> None:
+        """Draws the listbox from what's already known — no network calls,
+        safe to call anytime (e.g. right after a background freshness check)."""
+        selected = self.manage_listbox.curselection()
         self.manage_listbox.delete(0, tk.END)
         for p in self.projects:
-            contributors = _read_contributors(Path(p["path"])) if Path(p["path"]).is_dir() else []
+            name = p.get("display_name") or Path(p["path"]).name
+            star = "* " if p["path"] in self.manage_stale else ""
+            contributors = read_contributors(Path(p["path"])) if Path(p["path"]).is_dir() else []
             who = ", ".join(contributors) if contributors else "no contributors yet"
-            self.manage_listbox.insert(
-                tk.END, f"{Path(p['path']).name}  [{p['sync_code']}]  ({p['role']}) — {who}"
-            )
+            self.manage_listbox.insert(tk.END, f"{star}{name}  —  {who}  ({p['role']})")
+        if selected:
+            self.manage_listbox.selection_set(selected[0])
+
+    def _refresh_manage_list(self) -> None:
+        self._render_manage_list()
+        self._check_manage_freshness()
+
+    def _check_manage_freshness(self) -> None:
+        """Compares each project's stored synced_remote_mtime against Drive's
+        current one — one lightweight metadata call per project, run in the
+        background so opening/refreshing Manage Projects never blocks the UI."""
+        projects_snapshot = list(self.projects)
+
+        def work() -> set[str]:
+            stale = set()
+            for p in projects_snapshot:
+                remote_mtime = remote_archive_mtime(remote_path_for_id(GDRIVE_REMOTE_NAME, p["sync_code"]))
+                synced_mtime = p.get("synced_remote_mtime")
+                if remote_mtime and (not synced_mtime or remote_mtime > synced_mtime):
+                    stale.add(p["path"])
+            return stale
+
+        def done(stale: set[str]) -> None:
+            self.manage_stale = stale
+            self._render_manage_list()
+
+        self._run_async(work, done)
 
     def _selected_manage_project(self) -> dict | None:
         selection = self.manage_listbox.curselection()
         if not selection:
-            self._banner("Select a project from the list first.", "error")
+            self._banner("select a project from the list first.", "error")
             return None
         return self.projects[selection[0]]
 
@@ -526,7 +615,7 @@ class ProjectPickerApp:
         if not selection:
             return
         p = self.projects[selection[0]]
-        self.manage_detail_label.config(text=f"Path: {p['path']}\nCode: {p['sync_code']}")
+        self.manage_detail_label.config(text=f"path: {p['path']}\ncode: {p['sync_code']}")
 
     def _manage_push(self) -> None:
         p = self._selected_manage_project()
@@ -537,12 +626,23 @@ class ProjectPickerApp:
             return
         if not self._require_username():
             return
-        _add_contributor(Path(p["path"]), self.username_var.get().strip())
-        self._async_sync(
+        add_contributor(Path(p["path"]), self.username_var.get().strip())
+
+        def on_success(mtime) -> None:
+            self._remember_project(
+                p["path"],
+                p["sync_code"],
+                p["role"],
+                last_pushed=datetime.now(timezone.utc).isoformat(),
+                last_pushed_by=self.username_var.get().strip(),
+                synced_remote_mtime=mtime,
+            )
+
+        self._async_push_archive(
             p["path"],
-            self._remote_path_for(p["sync_code"]),
+            remote_archive_path_for(p["sync_code"]),
             self.manage_status_label,
-            self._refresh_manage_list,
+            on_success,
             button=self.manage_push_button,
         )
 
@@ -552,33 +652,81 @@ class ProjectPickerApp:
             return
         local_path = Path(p["path"])
         if local_path.is_dir() and any(local_path.iterdir()) and not messagebox.askyesno(
-            "Pull from Drive",
-            f"This overwrites local files in {local_path} with what's in Drive.\n"
-            "Any local changes not yet synced will be lost. Continue?",
+            "pull from drive",
+            f"this overwrites local files in {local_path} with what's in drive.\n"
+            "any local changes not yet synced will be lost. continue?",
         ):
             return
         local_path.mkdir(parents=True, exist_ok=True)
-        self._async_sync(
-            self._remote_path_for(p["sync_code"]),
+
+        def on_success(mtime) -> None:
+            self._remember_project(p["path"], p["sync_code"], p["role"], synced_remote_mtime=mtime)
+
+        self._async_pull_archive(
+            remote_archive_path_for(p["sync_code"]),
             str(local_path),
             self.manage_status_label,
-            self._refresh_manage_list,
+            on_success,
             button=self.manage_pull_button,
         )
 
-    def _manage_check_tracks(self) -> None:
+    def _manage_project_info(self) -> None:
         p = self._selected_manage_project()
         if not p:
             return
-        local = _local_track_count(Path(p["path"])) if Path(p["path"]).is_dir() else None
-        remote = _remote_track_count(self._remote_path_for(p["sync_code"]))
-        local_str = str(local) if local is not None else "no .als found"
-        remote_str = str(remote) if remote is not None else "no .als found"
-        mismatch = local is not None and remote is not None and local != remote
-        self.manage_status_label.config(
-            text=f"Tracks — local: {local_str} | drive: {remote_str}",
-            fg="#b8860b" if mismatch else "gray",
+        project_dir = Path(p["path"])
+        local_info = _local_als_info(project_dir) if project_dir.is_dir() else None
+        remote_info = _remote_als_info(remote_archive_path_for(p["sync_code"]))
+
+        local_tracks = str(local_info["track_count"]) if local_info else "no .als found"
+        remote_tracks = str(remote_info["track_count"]) if remote_info else "no .als found"
+        mismatch = (
+            local_info is not None
+            and remote_info is not None
+            and local_info["track_count"] != remote_info["track_count"]
         )
+
+        vst_names = local_info["vst_names"] if local_info else []
+        installed_names = {plugin.name.lower() for plugin in scan_installed_plugins()}
+
+        last_pushed = p.get("last_pushed")
+        if last_pushed:
+            last_pushed_line = datetime.fromisoformat(last_pushed).astimezone().strftime("%Y-%m-%d %H:%M")
+        else:
+            last_pushed_line = "never"
+        last_pushed_by = p.get("last_pushed_by")
+
+        text = self.manage_info_text
+        text.config(state="normal")
+        text.delete("1.0", tk.END)
+
+        text.insert(tk.END, "tracks — local: ", "mismatch" if mismatch else ())
+        text.insert(tk.END, f"{local_tracks} | drive: {remote_tracks}\n", "mismatch" if mismatch else ())
+
+        text.insert(tk.END, "vsts used: ")
+        if vst_names:
+            for i, name in enumerate(vst_names):
+                # Ableton's own project metadata inconsistently includes/omits the
+                # vendor prefix (e.g. "Pro-L 2" vs "FabFilter Pro-L 2"), so match
+                # either way being a substring of the other rather than exact equality.
+                name_l = name.lower()
+                is_installed = any(
+                    name_l in installed or installed in name_l for installed in installed_names
+                )
+                tag = "green" if is_installed else "red"
+                text.insert(tk.END, name, tag)
+                if i < len(vst_names) - 1:
+                    text.insert(tk.END, ", ")
+        else:
+            text.insert(tk.END, "none found")
+        text.insert(tk.END, "\n")
+
+        text.insert(tk.END, f"last pushed to drive: {last_pushed_line}")
+        if last_pushed_by:
+            text.insert(tk.END, f" [{last_pushed_by}]")
+        text.insert(tk.END, f"\ndrive folder id: {p['sync_code']}")
+
+        text.config(state="disabled")
 
     def _manage_share(self) -> None:
         p = self._selected_manage_project()
@@ -586,7 +734,7 @@ class ProjectPickerApp:
             return
         email = self.manage_partner_email_var.get().strip()
         if not email:
-            self._banner("Enter the collaborator's Google account email.", "error")
+            self._banner("enter the collaborator's google account email.", "error")
             return
         self._share_folder(p["sync_code"], email, self.manage_status_label)
 
@@ -597,18 +745,19 @@ class ProjectPickerApp:
 
         tk.Label(
             frame,
-            text="Connect your Google Drive account (opens a browser sign-in):",
+            text="connect your google drive account (opens a browser sign-in):",
             wraplength=420,
             justify="left",
         ).grid(row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(8, 0))
-        self.gdrive_setup_button = tk.Button(
-            frame, text="GDrive Setup", width=16, command=self._settings_gdrive_setup
+
+        self.gdrive_setup_button = ttk.Button(
+            frame, text="gdrive setup", width=16, command=self._settings_gdrive_setup
         )
         self.gdrive_setup_button.grid(row=1, column=0, columnspan=2, pady=4)
         self.remote_status_label = tk.Label(frame, text="", fg="gray")
         self.remote_status_label.grid(row=2, column=0, columnspan=2, sticky="w", padx=12)
 
-        tk.Label(frame, text="Your username (shown to collaborators):").grid(
+        tk.Label(frame, text="your username (shown to collaborators):").grid(
             row=3, column=0, columnspan=2, sticky="w", padx=12, pady=(12, 0)
         )
         tk.Entry(frame, textvariable=self.username_var, width=40).grid(
@@ -616,36 +765,36 @@ class ProjectPickerApp:
         )
 
         tk.Label(
-            frame, text="Custom VST2 folders (only needed if you don't use standard install paths):"
+            frame, text="custom vst2 folders (only needed if you don't use standard install paths):"
         ).grid(row=5, column=0, columnspan=2, sticky="w", padx=12, pady=(12, 0))
         self.vst2_listbox = tk.Listbox(frame, height=4, width=60)
         self.vst2_listbox.grid(row=6, column=0, columnspan=2, padx=12, pady=4, sticky="we")
         vst2_button_row = tk.Frame(frame)
         vst2_button_row.grid(row=7, column=0, columnspan=2)
-        tk.Button(vst2_button_row, text="Add...", command=lambda: self._settings_add_path("vst2")).pack(
+        ttk.Button(vst2_button_row, text="add...", command=lambda: self._settings_add_path("vst2")).pack(
             side="left", padx=6
         )
-        tk.Button(
-            vst2_button_row, text="Remove Selected", command=lambda: self._settings_remove_path("vst2")
+        ttk.Button(
+            vst2_button_row, text="remove selected", command=lambda: self._settings_remove_path("vst2")
         ).pack(side="left", padx=6)
 
-        tk.Label(frame, text="Custom VST3 folders:").grid(
+        tk.Label(frame, text="custom vst3 folders:").grid(
             row=8, column=0, columnspan=2, sticky="w", padx=12, pady=(12, 0)
         )
         self.vst3_listbox = tk.Listbox(frame, height=4, width=60)
         self.vst3_listbox.grid(row=9, column=0, columnspan=2, padx=12, pady=4, sticky="we")
         vst3_button_row = tk.Frame(frame)
         vst3_button_row.grid(row=10, column=0, columnspan=2)
-        tk.Button(vst3_button_row, text="Add...", command=lambda: self._settings_add_path("vst3")).pack(
+        ttk.Button(vst3_button_row, text="add...", command=lambda: self._settings_add_path("vst3")).pack(
             side="left", padx=6
         )
-        tk.Button(
-            vst3_button_row, text="Remove Selected", command=lambda: self._settings_remove_path("vst3")
+        ttk.Button(
+            vst3_button_row, text="remove selected", command=lambda: self._settings_remove_path("vst3")
         ).pack(side="left", padx=6)
 
         self.settings_status_label = tk.Label(frame, text="", fg="gray")
         self.settings_status_label.grid(row=11, column=0, columnspan=2, sticky="w", padx=12, pady=4)
-        tk.Button(frame, text="Save Settings", width=16, command=self._settings_save).grid(
+        ttk.Button(frame, text="save settings", width=16, command=self._settings_save).grid(
             row=12, column=0, columnspan=2, pady=12
         )
 
@@ -661,7 +810,7 @@ class ProjectPickerApp:
 
     def _settings_add_path(self, fmt: str) -> None:
         selected = filedialog.askdirectory(
-            title=f"Select a custom {fmt.upper()} folder", initialdir=str(Path.home())
+            title=f"select a custom {fmt} folder", initialdir=str(Path.home())
         )
         if not selected:
             return
@@ -680,27 +829,24 @@ class ProjectPickerApp:
         self._refresh_settings_lists()
 
     def _settings_gdrive_setup(self) -> None:
-        self.remote_status_label.config(text="Opening browser for Google sign-in...", fg="gray")
+        self.remote_status_label.config(text="opening browser for google sign-in...", fg="gray")
         self.gdrive_setup_button.config(state="disabled")
 
         def work() -> subprocess.CompletedProcess:
             _kill_stale_oauth_listener()
-            return subprocess.run(
-                ["rclone", "config", "create", GDRIVE_REMOTE_NAME, "drive", "scope=drive"],
-                capture_output=True,
-                text=True,
-            )
+            args = [RCLONE_BIN, "config", "create", GDRIVE_REMOTE_NAME, "drive", "scope=drive"]
+            return subprocess.run(args, capture_output=True, text=True)
 
         self._run_async(work, self._settings_gdrive_setup_done)
 
     def _settings_gdrive_setup_done(self, result: subprocess.CompletedProcess) -> None:
         self.gdrive_setup_button.config(state="normal")
         if result.returncode == 0 and rclone_remote_exists(GDRIVE_REMOTE_NAME):
-            self.remote_status_label.config(text="Google Drive connected.", fg="green")
-            self._banner("Google Drive is set up.", "success")
+            self.remote_status_label.config(text="google drive connected.", fg="green")
+            self._banner("google drive is set up.", "success")
         else:
-            self.remote_status_label.config(text="Setup failed.", fg="red")
-            self._banner(f"GDrive setup failed: {result.stderr or 'Unknown error'}", "error")
+            self.remote_status_label.config(text="setup failed.", fg="red")
+            self._banner(f"gdrive setup failed: {result.stderr or 'unknown error'}", "error")
         self._update_new_tab_gate()
 
     def _settings_save(self) -> None:
@@ -708,7 +854,7 @@ class ProjectPickerApp:
         config["username"] = self.username_var.get().strip()
         config["custom_vst_paths"] = {"vst2": self.custom_vst2_paths, "vst3": self.custom_vst3_paths}
         save_config(config)
-        self.settings_status_label.config(text="Settings saved.", fg="green")
+        self.settings_status_label.config(text="settings saved.", fg="green")
 
 
 def main() -> None:

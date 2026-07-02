@@ -12,15 +12,17 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from studs.config import RCLONE_BIN
+
 
 def _rclone_config_path() -> Path:
-    result = subprocess.run(["rclone", "config", "file"], capture_output=True, text=True, check=True)
+    result = subprocess.run([RCLONE_BIN, "config", "file"], capture_output=True, text=True, check=True)
     return Path(result.stdout.strip().splitlines()[-1])
 
 
 def _access_token(remote: str) -> str:
     # Touch the remote so rclone refreshes a near-expiry token before we read it.
-    subprocess.run(["rclone", "lsd", f"{remote}:", "--max-depth", "1"], capture_output=True, text=True)
+    subprocess.run([RCLONE_BIN, "lsd", f"{remote}:", "--max-depth", "1"], capture_output=True, text=True)
     cp = configparser.ConfigParser()
     cp.read(_rclone_config_path())
     token = json.loads(cp[remote]["token"])
@@ -34,7 +36,7 @@ def folder_id_by_name(remote: str, parent_path: str, name: str) -> str | None:
     the ID itself is used directly to address it (see `remote_path_for_id`).
     """
     result = subprocess.run(
-        ["rclone", "lsjson", f"{remote}:{parent_path}", "--dirs-only"],
+        [RCLONE_BIN, "lsjson", f"{remote}:{parent_path}", "--dirs-only"],
         capture_output=True,
         text=True,
     )
@@ -65,4 +67,4 @@ def share_project_folder(remote: str, folder_id: str, email: str, role: str = "w
     try:
         urllib.request.urlopen(request)
     except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Drive API error {e.code}: {e.read().decode()}") from e
+        raise RuntimeError(f"drive api error {e.code}: {e.read().decode()}") from e

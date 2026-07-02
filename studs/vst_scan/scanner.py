@@ -75,7 +75,9 @@ def _scan_mac_dir(directory: Path, fmt: str) -> list[Plugin]:
         return []
     plugins = []
     suffix = ".vst3" if fmt == "vst3" else ".vst"
-    for entry in directory.iterdir():
+    # Recursive: some vendors (e.g. MeldaProduction) install into vendor/category
+    # subfolders rather than dropping the bundle directly in the VST/VST3 root.
+    for entry in directory.rglob(f"*{suffix}"):
         if entry.suffix != suffix:
             continue
         bundle_id, version = _read_mac_bundle_info(entry)
