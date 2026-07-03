@@ -33,6 +33,11 @@ def main(argv: list[str] | None = None) -> int:
     new_project.add_argument("--live-set", required=True, type=Path)
     new_project.add_argument("--name", default=None, help="optional display name")
 
+    join = subparsers.add_parser("join")
+    join.add_argument("--live-set", required=True, type=Path, help="folder to save the project into")
+    join.add_argument("--code", required=True, help="sync code someone shared with you")
+    join.add_argument("--name", default=None, help="optional display name")
+
     args = parser.parse_args(argv)
 
     # A real --live-set from Max's live.path is always an absolute path. An
@@ -47,6 +52,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "new-project":
         return _new_project(args.live_set, args.name, username)
+
+    if args.command == "join":
+        return _join(args.live_set, args.code.strip(), args.name)
 
     project = find_project(load_projects(), args.live_set)
     if project is None:
@@ -102,6 +110,36 @@ def _pull(project: dict) -> int:
     return 0
 
 
+def _join(live_set: Path, code: str, display_name: str | None) -> int:
+    if not code:
+        print("ERROR: no sync code given")
+        return 1
+
+    projects = load_projects()
+    existing = find_project(projects, live_set)
+    if existing is not None:
+        print(f"ERROR: this folder is already tracked (code: {existing['sync_code']})")
+        return 1
+
+    live_set.mkdir(parents=True, exist_ok=True)
+    result = pull_archive(remote_archive_path_for(code), str(live_set))
+    if not result["ok"]:
+        print(f"ERROR: {result['error'] or 'unknown error'}")
+        return 1
+
+    projects = upsert_project(
+        projects,
+        str(live_set),
+        code,
+        "imported",
+        display_name=display_name,
+        synced_remote_mtime=result["mtime"],
+    )
+    save_projects(projects)
+    print(f"OK: joined project {display_name or live_set.name}")
+    return 0
+
+
 def _new_project(live_set: Path, display_name: str | None, username: str) -> int:
     if not username:
         print("ERROR: no username set — open studs and set one in settings")
@@ -132,7 +170,8 @@ def _new_project(live_set: Path, display_name: str | None, username: str) -> int
         synced_remote_mtime=result["mtime"],
     )
     save_projects(projects)
-    print(f"OK: created project {display_name or folder.name} (code: {result['sync_code']})")
+    suffix = f" — note: {result['warning']}" if result.get("warning") else ""
+    print(f"OK: created project {display_name or folder.name} (code: {result['sync_code']}){suffix}")
     return 0
 
 

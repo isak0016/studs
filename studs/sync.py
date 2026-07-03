@@ -6,6 +6,7 @@ import json
 import secrets
 import subprocess
 import tempfile
+import time
 import zipfile
 from pathlib import Path
 
@@ -187,4 +188,20 @@ def create_new_project(local_folder: str, username: str, display_name: str | Non
             "sync_code": None,
             "mtime": None,
         }
-    return {"ok": True, "error": None, "sync_code": folder_id, "mtime": push_result["mtime"]}
+
+    # Drive's by-ID lookup (what every later push/pull uses) can lag behind
+    # its by-name lookup (what we just used above) for a folder that copyto
+    # auto-created as a side effect, rather than an explicit mkdir. This delay
+    # is sometimes seconds, sometimes much longer (minutes+) — not something
+    # worth blocking on synchronously. Take one quick look so a fast-settling
+    # folder gets its mtime recorded immediately; if it's not ready yet, still
+    # report success (the code is genuinely valid, push_archive did succeed)
+    # but flag that push/pull may not work quite yet.
+    remote_folder = remote_path_for_id(GDRIVE_REMOTE_NAME, folder_id)
+    mtime = remote_archive_mtime(remote_folder)
+    if mtime is None:
+        time.sleep(3)
+        mtime = remote_archive_mtime(remote_folder)
+
+    warning = None if mtime is not None else "drive is still indexing the new folder — push/pull may fail for a bit"
+    return {"ok": True, "error": None, "sync_code": folder_id, "mtime": mtime, "warning": warning}

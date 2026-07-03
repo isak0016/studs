@@ -42,7 +42,22 @@ function chooseProjectFolder(callback) {
   });
 }
 
-module.exports = { runCli, confirmCollectAndSave, chooseProjectFolder, PYTHON, STUDS_REPO };
+function copyToClipboard(text, callback) {
+  // execFile passes args as an array, not through a shell, so no quoting/
+  // injection concern even though `text` is interpolated into the AppleScript.
+  execFile("osascript", ["-e", `set the clipboard to "${text}"`], (err) => {
+    callback(!err);
+  });
+}
+
+module.exports = {
+  runCli,
+  confirmCollectAndSave,
+  chooseProjectFolder,
+  copyToClipboard,
+  PYTHON,
+  STUDS_REPO,
+};
 
 // Only wire up the Max-specific side when running inside Node for Max —
 // `require("max-api")` throws outside it, which keeps the functions above
@@ -54,8 +69,15 @@ try {
   Max = null;
 }
 
+// Pulls a "(code: XXXX)" tail off an OK line so it can be routed to the
+// dedicated sync-code display separately from the human-readable status.
+function extractCode(line) {
+  const match = line.match(/\(code: ([^)]+)\)/);
+  return match ? match[1] : null;
+}
+
 if (Max) {
-  // liveSetPath comes from the patcher's pattr-stored value (see the .maxpat) —
+  // liveSetPath comes from the patcher's value-stored path (see the .maxpat) —
   // not from Live's API, which doesn't expose the project's filesystem path.
   Max.addHandler("sync", (direction, liveSetPath) => {
     runCli([direction, "--live-set", liveSetPath], (line) => Max.outlet(line));
@@ -63,9 +85,30 @@ if (Max) {
 
   Max.addHandler("newproject", (liveSetPath) => {
     confirmCollectAndSave(
-      () => runCli(["new-project", "--live-set", liveSetPath], (line) => Max.outlet(line)),
+      () => runCli(["new-project", "--live-set", liveSetPath], (line) => {
+        const code = extractCode(line);
+        if (code) {
+          // Two separate atoms, not one concatenated string — keeps the code
+          // intact as its own atom through [route synccode].
+          Max.outlet("synccode", code);
+        }
+        Max.outlet(line);
+      }),
       () => Max.outlet("cancelled: run collect all and save first"),
     );
+  });
+
+  Max.addHandler("join", (code) => {
+    chooseProjectFolder((folder) => {
+      if (!folder) {
+        Max.outlet("cancelled: no folder chosen");
+        return;
+      }
+      runCli(["join", "--code", code, "--live-set", folder], (line) => {
+        Max.outlet("projectfolder", folder);
+        Max.outlet(line);
+      });
+    });
   });
 
   Max.addHandler("import", () => {
@@ -74,10 +117,17 @@ if (Max) {
         Max.outlet("cancelled: no folder chosen");
         return;
       }
-      // Two separate atoms, not one concatenated string — keeps the path
-      // (which may contain spaces) intact as its own atom through
-      // [route projectfolder] rather than risking it being word-split.
       Max.outlet("projectfolder", folder);
+    });
+  });
+
+  Max.addHandler("copycode", (code) => {
+    if (!code) {
+      Max.outlet("no code to copy yet");
+      return;
+    }
+    copyToClipboard(code, (ok) => {
+      Max.outlet(ok ? "copied to clipboard" : "ERROR: could not copy to clipboard");
     });
   });
 }
